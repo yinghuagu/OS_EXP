@@ -3,3 +3,5 @@
 #define O_RDWR    0x002
 #define O_CREATE  0x200
 #define O_TRUNC   0x400
+#define O_APPEND  0x800   // Append mode
+#define O_NOFOLLOW 0x1000 // Do not follow symbolic links

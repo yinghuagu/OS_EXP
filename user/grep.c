@@ -1,4 +1,5 @@
-// Simple grep.  Only supports ^ . * $ operators.
+// Simple grep. Only supports ^ . * $ operators.
+// Supports case-insensitive search (-i).
 
 #include "kernel/types.h"
 #include "kernel/stat.h"
@@ -7,6 +8,13 @@
 
 char buf[1024];
 int match(char*, char*);
+int ignore_case = 0; // Global flag for case-insensitivity
+
+// Helper: Convert character to lower case
+char to_lower(char c) {
+  if (c >= 'A' && c <= 'Z') return c + 32;
+  return c;
+}
 
 void
 grep(char *pattern, int fd)
@@ -25,6 +33,7 @@ grep(char *pattern, int fd)
         *q = '\n';
         write(1, p, q+1 - p);
       }
+      *q = '\n';
       p = q+1;
     }
     if(m > 0){
@@ -39,19 +48,31 @@ main(int argc, char *argv[])
 {
   int fd, i;
   char *pattern;
+  int idx = 1;
 
   if(argc <= 1){
-    fprintf(2, "usage: grep pattern [file ...]\n");
+    fprintf(2, "usage: grep [-i] pattern [file ...]\n");
     exit(1);
   }
-  pattern = argv[1];
 
-  if(argc <= 2){
+  // Parse -i flag
+  if(strcmp(argv[1], "-i") == 0){
+    if(argc <= 2){
+        fprintf(2, "usage: grep [-i] pattern [file ...]\n");
+        exit(1);
+    }
+    ignore_case = 1;
+    idx = 2;
+  }
+
+  pattern = argv[idx];
+
+  if(argc <= idx + 1){
     grep(pattern, 0);
     exit(0);
   }
 
-  for(i = 2; i < argc; i++){
+  for(i = idx + 1; i < argc; i++){
     if((fd = open(argv[i], O_RDONLY)) < 0){
       printf("grep: cannot open %s\n", argv[i]);
       exit(1);
@@ -62,9 +83,7 @@ main(int argc, char *argv[])
   exit(0);
 }
 
-// Regexp matcher from Kernighan & Pike,
-// The Practice of Programming, Chapter 9, or
-// https://www.cs.princeton.edu/courses/archive/spr09/cos333/beautiful.html
+// Regexp matcher from Kernighan & Pike
 
 int matchhere(char*, char*);
 int matchstar(int, char*, char*);
@@ -90,7 +109,9 @@ int matchhere(char *re, char *text)
     return matchstar(re[0], re+2, text);
   if(re[0] == '$' && re[1] == '\0')
     return *text == '\0';
-  if(*text!='\0' && (re[0]=='.' || re[0]==*text))
+  
+  // Compare characters with case-sensitivity check
+  if(*text!='\0' && (re[0]=='.' || (ignore_case ? (to_lower(re[0])==to_lower(*text)) : (re[0]==*text))))
     return matchhere(re+1, text+1);
   return 0;
 }
@@ -101,7 +122,6 @@ int matchstar(int c, char *re, char *text)
   do{  // a * matches zero or more instances
     if(matchhere(re, text))
       return 1;
-  }while(*text!='\0' && (*text++==c || c=='.'));
+  }while(*text!='\0' && (c=='.' || (ignore_case ? (to_lower(*text++)==to_lower(c)) : (*text++==c))));
   return 0;
 }
-
