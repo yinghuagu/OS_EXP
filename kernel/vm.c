@@ -299,28 +299,89 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
-      continue;   // page table entry hasn't been allocated
+      continue;
     if((*pte & PTE_V) == 0)
-      continue;   // physical page hasn't been allocated
+      continue;
+      
     pa = PTE2PA(*pte);
+    
+    // 修改父进程页表：清除写权限，设置 COW
+    *pte = (*pte & ~PTE_W) | PTE_COW; 
+    
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    
+    // 将父进程的物理页映射到子进程
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
       goto err;
     }
+    
+    // 关键：增加引用计数 (因为现在父子都指向它)
+    inc_ref((void *)pa);
   }
   return 0;
 
- err:
+  err:
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
+}
+
+//增加方法 用于判断当前页是否是 cow page 
+int is_cow_page(pagetable_t pg, uint64 va) {
+  //如果虚拟地址大于最大虚拟地址说明是非法地址
+  if(va >= MAXVA)
+    return 0;
+  //虚拟地址向下取整  
+  va = PGROUNDDOWN(va);
+  //通过walk函数获取虚拟地址对应的pte
+  pte_t *pte = walk(pg, va, 0);
+  if (pte == 0) {
+    return 0;
+  }
+  if((*pte & PTE_V) == 0)
+    return 0;
+  if((*pte & PTE_U) == 0)
+    return 0;
+  // 返回是否是cow 
+  return (*pte & PTE_COW);
+}
+
+  
+//对cow page 进行内存复制
+int cow_alloc(pagetable_t pg, uint64 va) {
+  va = PGROUNDDOWN(va);
+  pte_t *pte = walk(pg, va, 0);
+  uint64 pa = PTE2PA(*pte);
+  // 获取原始页表的标志位信息
+  int flags = PTE_FLAGS(*pte);
+
+  // 分配新内存
+  char *mem = kalloc();
+  if (mem == 0) {
+    return -1;
+  }
+  // 复制旧页面内容到新页面
+  memmove(mem, (char *)pa, PGSIZE);
+
+  // 解除对旧物理地址的映射
+  // uvmunmap 这里只是清除 PTE，不释放物理内存 (因为 do_free=0)
+  uvmunmap(pg, va, 1, 0);
+
+  // 关键修改：使用 kfree 来处理旧物理页的引用计数
+  // kfree 会原子地减计数，并在计数为0时释放物理页
+  kfree((void*)pa); 
+
+  // 清除 PTE_COW 标志位，设置可写标志 PTE_W
+  flags = (flags & ~PTE_COW) | PTE_W;
+
+  // 将虚拟地址映射到新分配的物理页
+  if(mappages(pg, va, PGSIZE, (uint64)mem, flags) < 0) {
+    kfree(mem); // 映射失败，释放新分配的页
+    return -1;
+  }
+  return 0;
 }
 
 // mark a PTE invalid for user access.
@@ -349,19 +410,26 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     va0 = PGROUNDDOWN(dstva);
     if(va0 >= MAXVA)
       return -1;
-  
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0) {
-      if((pa0 = vmfault(pagetable, va0, 0)) == 0) {
+      
+    pte = walk(pagetable, va0, 0);
+    // 检查页表项是否存在且用户可访问
+    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
+      return -1;
+
+    // 关键修改：如果是 COW 页面，执行分配
+    if((*pte & PTE_COW) && (*pte & PTE_V)) {
+      if(cow_alloc(pagetable, va0) < 0)
         return -1;
-      }
+      // cow_alloc 会更新页表，我们需要重新获取 PTE 和 PA
+      pte = walk(pagetable, va0, 0); 
     }
 
-    pte = walk(pagetable, va0, 0);
-    // forbid copyout over read-only user text pages.
+    // 再次检查写权限（现在应该有了）
     if((*pte & PTE_W) == 0)
       return -1;
       
+    pa0 = PTE2PA(*pte);
+
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;

@@ -59,6 +59,8 @@ void            ireclaim(int);
 void*           kalloc(void);
 void            kfree(void *);
 void            kinit(void);
+int             inc_ref(void *);
+int             dec_ref(void *);
 
 // log.c
 void            initlog(int, struct superblock*);
@@ -169,6 +171,8 @@ int             copyin(pagetable_t, char *, uint64, uint64);
 int             copyinstr(pagetable_t, char *, uint64, uint64);
 int             ismapped(pagetable_t, uint64);
 uint64          vmfault(pagetable_t, uint64, int);
+int             is_cow_page(pagetable_t, uint64);
+int             cow_alloc(pagetable_t, uint64);
 
 // plic.c
 void            plicinit(void);
