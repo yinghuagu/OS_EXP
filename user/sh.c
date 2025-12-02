@@ -268,8 +268,6 @@ backcmd(struct cmd *subcmd)
 char whitespace[] = " \t\r\n\v";
 char symbols[] = "<|>&;()";
 
-// Parse tokens from the command line string.
-// Supports '>>' operator.
 int
 gettoken(char **ps, char *es, char **q, char **eq)
 {
@@ -295,8 +293,8 @@ gettoken(char **ps, char *es, char **q, char **eq)
     break;
   case '>':
     s++;
-    if(*s == '>'){ // Check for append redirection '>>'
-      ret = '+';   // Use '+' as internal token for append
+    if(*s == '>'){
+      ret = '+';
       s++;
     }
     break;
@@ -308,6 +306,7 @@ gettoken(char **ps, char *es, char **q, char **eq)
   }
   if(eq)
     *eq = s;
+
   while(s < es && strchr(whitespace, *s))
     s++;
   *ps = s;
@@ -378,8 +377,6 @@ parsepipe(char **ps, char *es)
   return cmd;
 }
 
-// Parse input/output redirections.
-// Handles '<', '>', and '>>'.
 struct cmd*
 parseredirs(struct cmd *cmd, char **ps, char *es)
 {
@@ -397,8 +394,8 @@ parseredirs(struct cmd *cmd, char **ps, char *es)
     case '>':
       cmd = redircmd(cmd, q, eq, O_WRONLY|O_CREATE|O_TRUNC, 1);
       break;
-    case '+': // Append redirection
-      cmd = redircmd(cmd, q, eq, O_WRONLY|O_CREATE|O_APPEND, 1);
+    case '+':  // >>
+      cmd = redircmd(cmd, q, eq, O_WRONLY|O_CREATE, 1);
       break;
     }
   }
