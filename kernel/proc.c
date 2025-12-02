@@ -4,7 +4,11 @@
 #include "riscv.h"
 #include "spinlock.h"
 #include "proc.h"
+#include "fs.h"
+#include "sleeplock.h"
 #include "defs.h"
+#include "file.h"
+#include "fcntl.h"
 
 struct cpu cpus[NCPU];
 
@@ -146,6 +150,9 @@ found:
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
 
+  for (int i = 0; i < VMA_COUNT; i ++) {
+    p->vmas[i].is_used = 0;
+  }
   return p;
 }
 
@@ -271,6 +278,12 @@ kfork(void)
     release(&np->lock);
     return -1;
   }
+  for (int i = 0; i < VMA_COUNT; i ++) {
+    np->vmas[i] = p->vmas[i];
+    if (np->vmas[i].is_used) {
+      filedup(np->vmas[i].file);
+    }
+  }
   np->sz = p->sz;
 
   // copy saved user registers.
@@ -338,6 +351,28 @@ kexit(int status)
   }
 
   begin_op();
+  for (int i = 0; i < VMA_COUNT; i ++) {
+    struct virtual_memory_area *vma = &p->vmas[i];
+    if (vma->is_used) {
+      if ((vma->flags & MAP_SHARED) && (vma->prot & PROT_WRITE)) {
+        struct inode *ip = vma->file->ip;
+        int file_sz = ip->size;
+        int file_off = vma->offset;
+        int wlen = vma->length;
+        if (file_off < file_sz) {
+          if (file_off + wlen > file_sz)
+            wlen = file_sz - file_off;
+          if (writei(ip, 1, vma->address, file_off, wlen) < 0) {
+            // ignore write-back error
+          }
+        }
+      }
+      fileclose(vma->file);
+      uvmunmap(p->pagetable, vma->address, vma->length / PGSIZE, 1);
+      vma->is_used = 0;
+    }
+  }
+
   iput(p->cwd);
   end_op();
   p->cwd = 0;
@@ -684,4 +719,56 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+int mmap_alloc_page(struct proc *p, uint64 va) {
+  struct virtual_memory_area *vma = 0;
+  for (int i = 0; i < VMA_COUNT; i ++) {
+    if (p->vmas[i].is_used
+    && p->vmas[i].address <= va && va < p->vmas[i].address + p->vmas[i].length) {
+      vma = &p->vmas[i];
+      break;
+    }
+  }
+  if (vma == 0) {
+    printf("mmap_alloc_page: no vma found, pid=%d va=0x%lx\n", p->pid, va);
+    return -1;
+  }
+ 
+  printf("mmap_alloc_page: pid=%d va=0x%lx vma_addr=0x%lx len=%d prot=%d flags=%d off=%d ip=%p ip_size=%d file_off=%d\n",
+         p->pid, va, vma->address, vma->length, vma->prot, vma->flags,
+         vma->offset, vma->file->ip, vma->file->ip->size, (int)(va - vma->address + vma->offset));
+
+  uint64 pa = (uint64)kalloc();
+  va = PGROUNDDOWN(va);
+  if (pa == 0) {
+    return -1;
+  }
+  memset((void*)pa, 0, PGSIZE);
+ 
+  ilock(vma->file->ip);
+  int file_off = va - vma->address + vma->offset;
+  printf("mmap_alloc_page: pid=%d reading file_off=%d\n", p->pid, file_off);
+  if (readi(vma->file->ip, 0, pa, file_off, PGSIZE) < 0) {
+    iunlock(vma->file->ip);
+    kfree((void*)pa);
+    return -1;
+  }
+  iunlock(vma->file->ip);
+
+  printf("mmap_alloc_page: pid=%d first_byte=0x%x\n", p->pid, ((uchar*)pa)[0]);
+ 
+  int pte_flags = PTE_U;
+  if (vma->prot & PROT_READ)
+    pte_flags |= PTE_R;
+  if (vma->prot & PROT_WRITE)
+    pte_flags |= PTE_W;
+  if (vma->prot & PROT_EXEC)
+    pte_flags |= PTE_X;
+ 
+  if (mappages(p->pagetable, va, PGSIZE, pa, pte_flags) < 0) {
+    kfree((void *)pa);
+    return -1;
+  }
+ 
+  return 0;
 }

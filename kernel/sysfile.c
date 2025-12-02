@@ -16,6 +16,119 @@
 #include "file.h"
 #include "fcntl.h"
 
+static int argfd(int n, int *pfd, struct file **pf);
+
+uint64 sys_mmap(void) {
+  uint64 addr;
+  int len;
+  int prot;
+  int flags;
+  int fd;
+  struct file *file;
+  int offset;
+
+  argaddr(0, &addr);
+  argint(1, &len);
+  argint(2, &prot);
+  argint(3, &flags);
+  if (argfd(4, &fd, &file) < 0)
+    return -1;
+  argint(5, &offset);
+ 
+  struct proc *p = myproc();
+  struct virtual_memory_area *vma = 0;
+  for (int i = 0; i < VMA_COUNT; i ++) {
+    if (!p->vmas[i].is_used) {
+      vma = &p->vmas[i];
+      break;
+    }
+  }
+  if (vma == 0) {
+    return -1;
+  }
+ 
+  if (!file->readable && (prot & PROT_READ))
+    return -1;
+  if (!file->writable && (prot & PROT_WRITE) && (flags & MAP_SHARED))
+    return -1;
+ 
+  len = PGROUNDUP(len);
+  if (p->sz + len >= MAXVA) 
+    return -1;
+ 
+  vma->is_used = 1;
+  vma->address = p->sz;
+  vma->length = len;
+  vma->prot = prot;
+  vma->flags = flags;
+  vma->fd = fd;
+  vma->file = file;
+  vma->offset = offset;
+  
+  filedup(file);
+  p->sz += len;
+ 
+  return vma->address;
+}
+uint64 sys_munmap(void) {
+  uint64 addr;
+  int len;
+
+  argaddr(0, &addr);
+  argint(1, &len);
+ 
+  struct proc *p = myproc();
+  struct virtual_memory_area *vma = 0;
+  for (int i = 0; i < VMA_COUNT; i ++) {
+    if (p->vmas[i].is_used && p->vmas[i].address <= addr && addr < p->vmas[i].address + p->vmas[i].length) {
+      vma = &p->vmas[i];
+      break;
+    }
+  }
+  if (vma == 0) {
+    return -1;
+  }
+ 
+  addr = PGROUNDDOWN(addr);
+  len = PGROUNDUP(len);
+
+  begin_op();
+  // only write back for shared, writable mappings
+  if ((vma->flags & MAP_SHARED) && (vma->prot & PROT_WRITE)) {
+    struct inode *ip = vma->file->ip;
+    int file_sz = ip->size;
+    int file_off = vma->offset + (addr - vma->address);
+    int wlen = len;
+    if (file_off < file_sz) {
+      if (file_off + wlen > file_sz)
+        wlen = file_sz - file_off;
+      if (writei(ip, 1, addr, file_off, wlen) < 0) {
+        // ignore write-back error
+      }
+    }
+  }
+
+  uvmunmap(p->pagetable, addr, len / PGSIZE, 1);
+ 
+  if (addr == vma->address) {
+    vma->address += len;
+    vma->length -= len;
+    vma->offset += len;
+  } else if (addr + len == vma->address + vma->length) {
+    vma->length -= len;
+  } else {
+    panic("munmap: wtf");
+  }
+ 
+  if (vma->length == 0) {
+    fileclose(vma->file);
+    vma->is_used = 0;
+  }
+
+  end_op();
+
+  return 0;
+}
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
 static int
@@ -301,7 +414,6 @@ create(char *path, short type, short major, short minor)
   return 0;
 }
 
-// Open a file; support symbolic links and O_APPEND.
 uint64
 sys_open(void)
 {
@@ -310,14 +422,10 @@ sys_open(void)
   struct file *f;
   struct inode *ip;
   int n;
-  int depth = 0; // Recursion depth counter to prevent infinite loops
 
-  // Fetch arguments.
-  // Note: argint returns void in this version of xv6.
+  argint(1, &omode);
   if((n = argstr(0, path, MAXPATH)) < 0)
     return -1;
-  
-  argint(1, &omode);
 
   begin_op();
 
@@ -328,44 +436,11 @@ sys_open(void)
       return -1;
     }
   } else {
-    // Loop to resolve symbolic links
-    while(1) {
-      if((ip = namei(path)) == 0){
-        end_op();
-        return -1;
-      }
-      ilock(ip);
-
-      // Check if it is a symbolic link and O_NOFOLLOW is not set
-      if(ip->type == T_SYMLINK && !(omode & O_NOFOLLOW)){
-        // Limit recursion depth to prevent stack overflow or deadlock
-        if(depth >= 10){
-          iunlockput(ip);
-          end_op();
-          return -1;
-        }
-        
-        // Read the target path from the inode
-        int len = readi(ip, 0, (uint64)path, 0, MAXPATH);
-        if(len <= 0){
-          iunlockput(ip);
-          end_op();
-          return -1;
-        }
-        
-        // Null-terminate the string, as readi does not add it automatically
-        path[len] = 0;
-        
-        iunlockput(ip);
-        depth++;
-        // Continue the loop with the resolved path
-      } else {
-        // Target found or O_NOFOLLOW is set
-        break;
-      }
+    if((ip = namei(path)) == 0){
+      end_op();
+      return -1;
     }
-
-    // Check directory permissions
+    ilock(ip);
     if(ip->type == T_DIR && omode != O_RDONLY){
       iunlockput(ip);
       end_op();
@@ -373,16 +448,15 @@ sys_open(void)
     }
   }
 
-  // Check device major number
   if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){
     iunlockput(ip);
     end_op();
     return -1;
   }
 
-  // Allocate file structure and file descriptor
   if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
-    if(f) fileclose(f);
+    if(f)
+      fileclose(f);
     iunlockput(ip);
     end_op();
     return -1;
@@ -395,18 +469,11 @@ sys_open(void)
     f->type = FD_INODE;
     f->off = 0;
   }
-
-  // Handle O_APPEND: Set offset to end of file
-  if((omode & O_APPEND) && ip->type == T_FILE){
-      f->off = ip->size;
-  }
-
   f->ip = ip;
   f->readable = !(omode & O_WRONLY);
   f->writable = (omode & O_WRONLY) || (omode & O_RDWR);
 
-  // Handle O_TRUNC: Truncate file if not in append mode
-  if((omode & O_TRUNC) && ip->type == T_FILE && !(omode & O_APPEND)){
+  if((omode & O_TRUNC) && ip->type == T_FILE){
     itrunc(ip);
   }
 
@@ -547,38 +614,5 @@ sys_pipe(void)
     fileclose(wf);
     return -1;
   }
-  return 0;
-}
-
-// Create a symbolic link.
-// argv[0]: target path
-// argv[1]: link path
-uint64
-sys_symlink(void)
-{
-  char target[MAXPATH], path[MAXPATH];
-  struct inode *ip;
-
-  if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
-    return -1;
-
-  begin_op();
-  
-  // Create a new inode of type T_SYMLINK
-  ip = create(path, T_SYMLINK, 0, 0);
-  if(ip == 0){
-    end_op();
-    return -1;
-  }
-  
-  // Write the target path into the inode's data blocks
-  if(writei(ip, 0, (uint64)target, 0, strlen(target)) != strlen(target)){
-    iunlockput(ip);
-    end_op();
-    return -1;
-  }
-  
-  iunlockput(ip);
-  end_op();
   return 0;
 }
