@@ -305,20 +305,26 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       continue;
     if((*pte & PTE_V) == 0)
       continue;
-      
+    
     pa = PTE2PA(*pte);
     
-    // 修改父进程页表：清除写权限，设置 COW
-    *pte = (*pte & ~PTE_W) | PTE_COW; 
+    // 关键修复：
+    // 只有当页面具有写权限(PTE_W)时，才清除写权限并设置 COW 标志。
+    // 如果页面本身就是只读的（如代码段），则保持原样（只读），不设置 PTE_COW。
+    // 这样子进程如果尝试写只读页，会触发不可恢复的 Page Fault，而不是 COW 分配。
+    if(*pte & PTE_W) {
+        *pte = (*pte & ~PTE_W) | PTE_COW;
+    }
     
+    // 获取更新后的 flags
     flags = PTE_FLAGS(*pte);
     
-    // 将父进程的物理页映射到子进程
+    // 将物理页映射到子进程
     if(mappages(new, i, PGSIZE, pa, flags) != 0){
       goto err;
     }
     
-    // 关键：增加引用计数 (因为现在父子都指向它)
+    // 无论是否设置了 COW，只要是共享映射，都需要增加引用计数
     inc_ref((void *)pa);
   }
   return 0;
