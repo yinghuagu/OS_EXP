@@ -69,21 +69,32 @@ usertrap(void)
   } else if((which_dev = devintr()) != 0){
     // ok
   } 
-  // else if((r_scause() == 15 || r_scause() == 13) &&
-  //           vmfault(p->pagetable, r_stval(), (r_scause() == 13)? 1 : 0) != 0) {
-  else if(r_scause() == 15 || r_scause() == 13){ //如果是page fault
-    // page fault on lazily-allocated page
+  else if(r_scause() == 15 || r_scause() == 13){ // 如果是 page fault
     uint64 va = r_stval();
-    if (is_cow_page(p->pagetable,va)) {
-      if (cow_alloc(p->pagetable,va) < 0) {
-        // setkilled(p);
+    int is_cow = 0;
+
+    // 1. 首先检查是否是 COW 页面引起的写错误 (scause 15)
+    // 只有写异常才可能是 COW (读异常在 COW 页上是允许的)
+    if(r_scause() == 15) {
+      is_cow = is_cow_page(p->pagetable, va);
+    }
+
+    if (is_cow) {
+      // 如果是 COW 页面，执行写时复制分配
+      if (cow_alloc(p->pagetable, va) < 0) {
         p->killed = 1;
       }
     } else {
-      printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
-      printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
-      // setkilled(p);
-      p->killed = 1;
+      // 2. 如果不是 COW，则尝试处理 Lazy Allocation (懒分配)
+      // 调用 vmfault 尝试分配新页。
+      // vmfault 在 vm.c 中定义，成功返回非0地址，失败返回0
+      // 第三个参数是 read 标志: 如果 scause==13 (Load Page Fault) 则为 1 (true)
+      if (vmfault(p->pagetable, va, (r_scause() == 13)) == 0) {
+        // 如果 vmfault 也失败（比如访问越界或内存不足），则判定为非法错误
+        printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
+        printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
+        p->killed = 1;
+      }
     }
   } else {
     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
