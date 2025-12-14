@@ -70,14 +70,48 @@ usertrap(void)
     // ok
   } else if (r_scause() == 13 || r_scause() == 15) {
     uint64 va = r_stval();
-    uint64 va0 = PGROUNDDOWN(va);
-    pte_t *pte = walk(p->pagetable, va0, 0);
-    if(pte && (*pte & PTE_V)){
-      // already mapped -> protection fault (e.g., write to read-only page)
+    if(va >= MAXVA){
+      // out-of-range address: kill process instead of calling walk()
       setkilled(p);
     } else {
-      if (mmap_alloc_page(p, va) != 0)
+      uint64 va0 = PGROUNDDOWN(va);
+      pte_t *pte = walk(p->pagetable, va0, 0);
+      if(pte && (*pte & PTE_V)){
+        // already mapped -> protection fault (e.g., write to read-only page)
         setkilled(p);
+      } else {
+        // not yet mapped: decide between mmap-backed and sbrk-backed
+        struct virtual_memory_area *vma = 0;
+        for (int i = 0; i < VMA_COUNT; i++) {
+          if (p->vmas[i].is_used &&
+              p->vmas[i].address <= va && va < p->vmas[i].address + p->vmas[i].length) {
+            vma = &p->vmas[i];
+            break;
+          }
+        }
+
+        if (vma) {
+          // lazy mmap page
+          if (mmap_alloc_page(p, va) != 0)
+            setkilled(p);
+        } else {
+          // not in any VMA: only treat as lazy sbrk page if it's below all mmap regions
+          uint64 mmap_min = MAXVA;
+          for (int i = 0; i < VMA_COUNT; i++) {
+            if (p->vmas[i].is_used && p->vmas[i].address < mmap_min)
+              mmap_min = p->vmas[i].address;
+          }
+
+          if (mmap_min == MAXVA || va < mmap_min) {
+            // lazy sbrk page
+            if (vmfault(p->pagetable, va, /*read*/ r_scause() == 13 ? 1 : 0) == 0)
+              setkilled(p);
+          } else {
+            // gap or tail of an unmapped mmap region: should fault, not lazily allocate
+            setkilled(p);
+          }
+        }
+      }
     }
   } else {
     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
